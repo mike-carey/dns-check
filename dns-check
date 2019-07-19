@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+
+function dns-check() {
+  export __SCRIPT__=$(basename $0)
+  export __VERSION__=1.0.0
+
+  function main() {
+    local verbose=false
+    local config_file=${DNS_CHECK_CONFIG:-~/.dns-check.json}
+    local args=()
+    while [[ -n "${1:-}" ]]; do
+      case "$1" in
+        --config )
+          config_file="$2"
+          shift
+          ;;
+        --verbose )
+          verbose=true
+          ;;
+        --version )
+          echo "$__SCRIPT__ $__VERSION__"
+          return 0
+          ;;
+        -- )
+          shift
+          args+=("$@")
+          break
+          ;;
+        * )
+          args+=("$1")
+          ;;
+      esac
+      shift
+    done
+
+    set -- ${args[@]:-}
+
+    command=${1:-}
+    if [[ -z "$command" ]]; then
+      command=check
+    else
+      shift
+    fi
+
+    case $command in
+      add | check )
+        $command $@
+        ;;
+      * )
+        echo "Unknown subcommand: $command" >&2
+        return 1
+        ;;
+    esac
+  }
+
+  function log() {
+    if [[ "$verbose" == "true" ]]; then
+      echo "[INFO] $@" >&2
+    fi
+  }
+
+  function add() {
+    if [[ $# -lt 2 ]]; then
+      echo "Usage: $__SCRIPT__ add HOST IPS..." >&2
+      return 2
+    fi
+
+    local host="$1"
+    shift
+
+    local ips=''
+    for ip in $@; do
+      ips="${ips}\"${ip}\","
+    done
+    ips="[${ips%,}]"
+
+    log "Adding $host as $ips"
+
+    local tmp="$config_file".tmp
+    trap "rm -f $tmp" EXIT
+
+    (cat "$config_file" 2>/dev/null || echo "{}") | jq '.hosts["'"$host"'"] = '"${ips}" > "$tmp"
+    mv "$tmp" "$config_file"
+  }
+
+  function check() {
+    local issues=()
+
+    for host in $((cat "$config_file" 2>/dev/null || echo "{}")| jq -rc '.hosts // {} | keys[]'); do
+      ips=()
+      for ip in $((cat "$config_file" 2>/dev/null || echo "{}") | jq -rc '.hosts // {} | .["'"$host"'"] // [] | .[]'); do
+        ips+=("$ip")
+      done
+
+      # Check ips returned from digging are in the configuration
+      for ip in $(dig +short $host); do
+        if [[ " ${ips[@]} " =~ " $ip " ]]; then
+          log "$host has an ip of $ip and it is already in the configuration"
+        else
+          log "$host has a new ip of $ip"
+          issues+=("$host has a new ip of $ip")
+        fi
+      done
+
+      # Check ips currently in the configuration reverse searched are the host
+      for ip in ${ips[@]}; do
+        if [[ "$(dig -x $ip +short)" == "$host." ]]; then
+          log "$ip still points to $host"
+        else
+          log "$ip no longer points to $host"
+          issues+=("$ip no longer points to $host")
+        fi
+      done
+    done
+
+    if [[ ${#issues[@]} -gt 0 ]]; then
+      log "There were issues"
+      for issue in "${issues[@]}"; do
+        echo "$issue"
+      done
+
+      return 3
+    fi
+
+    log "There were no issues"
+  }
+
+  main ${@:-}
+}
+
+if [[ ${BASH_SOURCE[0]} != $0 ]]; then
+  export -f dns-check
+else
+  set -euo pipefail
+
+  dns-check "${@:-}"
+  exit $?
+fi

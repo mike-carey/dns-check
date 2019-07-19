@@ -1,0 +1,11 @@
+---
+script_uri: https://github.com/mike-carey/dns-check.git
+script_branch: master
+
+config_uri: https://github.com/mike-carey/dns-check.git
+config_branch: master
+config_path: example.json
+
+schedule_location: America/Chicago
+schedule_start: 12:00 AM
+schedule_stop: 11:59 PM

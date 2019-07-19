@@ -1,0 +1,3 @@
+# vi:syntax=sh
+
+export DNS_CHECK_CONFIG=$PWD/.dns-check.json

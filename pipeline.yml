@@ -1,0 +1,82 @@
+---
+resources:
+- name: builder-task
+  type: registry-image
+  source:
+    repository: concourse/builder-task
+
+- name: script
+  type: git
+  source:
+    uri: ((script_uri))
+    branch: ((script_branch))
+    paths:
+    - dns-check
+    - Dockerfile
+
+- name: config
+  type: git
+  source:
+    uri: ((config_uri))
+    branch: ((config_branch))
+    paths:
+    - ((config_path))
+
+- name: schedule
+  type: time
+  source:
+    interval: 24h
+    location: ((schedule_location))
+    start: ((schedule_start))
+    stop: ((schedule_stop))
+
+jobs:
+- name: dns-check
+  plan:
+  - in_parallel:
+    - get: schedule
+      trigger: true
+    - get: script
+    - get: config
+    - get: builder-task
+  - task: build-docker-image
+    image: builder-task
+    privileged: true
+    config:
+      platform: linux
+      inputs:
+        - name: script
+      outputs:
+        - name: image
+        - name: rootfs
+      caches:
+        - path: cache
+      params:
+        REPOSITORY: dns-check
+        TAG: latest
+        CONTEXT: script
+      run:
+        path: build
+  - task: validate-json
+    image: rootfs
+    config:
+      platform: linux
+      inputs:
+      - name: config
+      run:
+        path: bash
+        args:
+          - -c
+          - jq . config/((config_path))
+  - task: check-dns-config
+    image: rootfs
+    config:
+      platform: linux
+      inputs:
+        - name: config
+        - name: script
+      run:
+        path: script/dns-check
+        args:
+          - --config config/((config_path))
+          - check
