@@ -1,135 +1,288 @@
 #!/usr/bin/env bash
 
-function dns-check() {
-  export __SCRIPT__=$(basename $0)
-  export __VERSION__=1.0.0
+export __SCRIPT__=$(basename $0)
+export __VERSION__=1.0.0
+export __VERBOSE__=${VERBOSE:-false}
+export __REQUIREMENTS__=(dig nmap sed cat jq grep awk)
 
-  function main() {
-    local verbose=false
-    local config_file=${DNS_CHECK_CONFIG:-~/.dns-check.json}
-    local args=()
-    while [[ -n "${1:-}" ]]; do
-      case "$1" in
-        --config )
-          config_file="$2"
-          shift
-          ;;
-        --verbose )
-          verbose=true
-          ;;
-        --version )
-          echo "$__SCRIPT__ $__VERSION__"
-          return 0
-          ;;
-        -- )
-          shift
-          args+=("$@")
-          break
-          ;;
-        * )
-          args+=("$1")
-          ;;
-      esac
-      shift
-    done
+function log() {
+  if [[ "$__VERBOSE__" == "true" ]]; then
+    echo "[INFO] $@" >&2
+  fi
+}
 
-    set -- ${args[@]:-}
+function error() {
+  local code=$(($1))
+  shift
 
-    command=${1:-}
-    if [[ -z "$command" ]]; then
-      command=check
-    else
-      shift
+  echo "[ERROR] $@" >&2
+  exit $code
+}
+
+function function_exists() {
+    declare -f -F $1 > /dev/null
+    return $?
+}
+
+function check_requirements() {
+  local origFlags="$-"
+  set +eET
+
+  # Check for required clis
+  for cli in ${__REQUIREMENTS__[@]}; do
+    hash $cli
+    s=$?
+    if [[ $s != 0 ]]; then
+      error 255 "Missing required cli: $cli"
     fi
+  done
 
-    case $command in
-      add | check )
-        $command $@
+  set "-$origFlags"
+}
+check_requirements
+
+function dns-check() {
+  local verbose=false
+  local config_file=${DNS_CHECK_CONFIG:-~/.dns-check.json}
+  local args=()
+  while [[ -n "${1:-}" ]]; do
+    case "$1" in
+      --config )
+        config_file="$2"
+        shift
+        ;;
+      --verbose )
+        verbose=true
+        ;;
+      --version )
+        echo "$__SCRIPT__ $__VERSION__"
+        return 0
+        ;;
+      -- )
+        shift
+        args+=("$@")
+        break
         ;;
       * )
-        echo "Unknown subcommand: $command" >&2
-        return 1
+        args+=("$1")
         ;;
     esac
-  }
-
-  function log() {
-    if [[ "$verbose" == "true" ]]; then
-      echo "[INFO] $@" >&2
-    fi
-  }
-
-  function add() {
-    if [[ $# -lt 2 ]]; then
-      echo "Usage: $__SCRIPT__ add HOST IPS..." >&2
-      return 2
-    fi
-
-    local host="$1"
     shift
+  done
 
-    local ips=''
-    for ip in $@; do
-      ips="${ips}\"${ip}\","
+  set -- ${args[@]:-}
+
+  command=${1:-}
+  if [[ -z "$command" ]]; then
+    command=check
+  else
+    shift
+  fi
+
+  if function_exists $__SCRIPT__.$command; then
+    $__SCRIPT__.$command ${@:-}
+    return $?
+  fi
+
+  error 1 "Unknown subcommand: $command" >&2
+}
+
+function dns-check.add() {
+  if [[ $# -lt 2 ]]; then
+    echo "Usage: $__SCRIPT__ add HOST IPS..." >&2
+    return 2
+  fi
+
+  local host="$1"
+  shift
+
+  local ips=''
+  for ip in $@; do
+    ips="${ips}\"${ip}\","
+  done
+  ips="[${ips%,}]"
+
+  log "Adding $host as $ips"
+
+  local tmp="$config_file".tmp
+  trap "rm -f $tmp" EXIT
+
+  (cat "$config_file" 2>/dev/null || echo "{}") | jq '.hosts["'"$host"'"] = (.hosts["'"$host"'"] // []) '"${ips}" > "$tmp"
+  mv "$tmp" "$config_file"
+}
+
+function dns-check.check() {
+  local issues=()
+
+  for host in $((cat "$config_file" 2>/dev/null || echo "{}")| jq -rc '.hosts // {} | keys[]'); do
+    ips=()
+    for ip in $((cat "$config_file" 2>/dev/null || echo "{}") | jq -rc '.hosts // {} | .["'"$host"'"] // [] | .[]'); do
+      ips+=("$ip")
     done
-    ips="[${ips%,}]"
 
-    log "Adding $host as $ips"
+    # Check ips returned from digging are in the configuration
+    for ip in $(dig +short $host); do
+      if [[ " ${ips[@]} " =~ " $ip " ]]; then
+        log "$host has an ip of $ip and it is already in the configuration"
+      else
+        log "$host has a new ip of $ip"
+        issues+=("$host has a new ip of $ip")
+      fi
+    done
 
-    local tmp="$config_file".tmp
-    trap "rm -f $tmp" EXIT
+    # Check ips currently in the configuration reverse searched are the host
+    for ip in ${ips[@]}; do
+      if [[ "$(dig -x $ip +short)" == "$host." ]]; then
+        log "$ip still points to $host"
+      else
+        log "$ip no longer points to $host"
+        issues+=("$ip no longer points to $host")
+      fi
+    done
+  done
 
-    (cat "$config_file" 2>/dev/null || echo "{}") | jq '.hosts["'"$host"'"] = '"${ips}" > "$tmp"
-    mv "$tmp" "$config_file"
-  }
+  if [[ ${#issues[@]} -gt 0 ]]; then
+    log "There were issues"
+    for issue in "${issues[@]}"; do
+      echo "$issue"
+    done
 
-  function check() {
-    local issues=()
+    return 3
+  fi
 
-    for host in $((cat "$config_file" 2>/dev/null || echo "{}")| jq -rc '.hosts // {} | keys[]'); do
-      ips=()
-      for ip in $((cat "$config_file" 2>/dev/null || echo "{}") | jq -rc '.hosts // {} | .["'"$host"'"] // [] | .[]'); do
-        ips+=("$ip")
-      done
+  log "There were no issues"
+}
 
-      # Check ips returned from digging are in the configuration
-      for ip in $(dig +short $host); do
-        if [[ " ${ips[@]} " =~ " $ip " ]]; then
-          log "$host has an ip of $ip and it is already in the configuration"
-        else
-          log "$host has a new ip of $ip"
-          issues+=("$host has a new ip of $ip")
+function dns-check.load() {
+  # local tmp="$(mktemp -d)"
+  # trap "rm -rf $tmp" EXIT
+  local tmp=.tmp
+
+  local js_file=$tmp/js
+  local ip_file=$tmp/ips
+
+  local next_page='/v2/security_groups'
+  while [[ "$next_page" != null ]]; do
+    cf curl $next_page > $js_file
+    for resource in "$(cat $js_file | jq -rc '.resources[]')"; do
+      for ip_range in $(echo "$resource" | jq -rc '.entity.rules[] | .destination'); do
+
+        local origFlags="$-"
+        set +eET
+
+        log "Expanding: $ip_range"
+        local expansion="$(dns-check.expand "$ip_range")"
+        local status=$?
+
+        set -$origFlags
+
+        if [[ $status -ne 0 ]]; then
+          log "Expanding $ip_range failed, moving on"
+          continue
         fi
-      done
 
-      # Check ips currently in the configuration reverse searched are the host
-      for ip in ${ips[@]}; do
-        if [[ "$(dig -x $ip +short)" == "$host." ]]; then
-          log "$ip still points to $host"
-        else
-          log "$ip no longer points to $host"
-          issues+=("$ip no longer points to $host")
-        fi
+        for ip in $expansion; do
+          echo $ip >> $ip_file
+        done
       done
     done
 
-    if [[ ${#issues[@]} -gt 0 ]]; then
-      log "There were issues"
-      for issue in "${issues[@]}"; do
-        echo "$issue"
-      done
+    next_page="$(cat $js_file | jq -r .next_url)"
+    log "Moving onto next page: $next_page"
+  done
 
-      return 3
+  local ips="$(cat $ip_file)"
+  for ignored in $(dns-check.ignored); do
+    ips="$(echo "$ips" | grep -ve "$ignored")"
+  done
+
+  for ip in $(echo "$ips" | sort | uniq); do
+    # Resolve the dns
+    dns=$(dig -x $ip +short)
+
+    if [[ -z "$dns" ]]; then
+      log "$ip did not resolve to a DNS entry, moving on"
+      continue
     fi
 
-    log "There were no issues"
-  }
+    # add it
+    log "Adding $dns $ip"
+    dns-check.add $dns $ip
+  done
+}
 
-  main ${@:-}
+###
+# @description Expands an IP range
+##
+function dns-check.expand() {
+  local ip_range="$1"
+  local format=ip
+  if [[ "${ip_range##*/}" != "$ip_range" ]]; then
+    format=cidr
+  elif [[ "${ip_range##*-}" != "$ip_range" ]]; then
+    format=range
+  fi
+
+  case $format in
+    ip )
+      log "$ip_range is only an IP"
+      echo $ip_range
+      return 0
+      ;;
+    range )
+      log "$ip_range is a range"
+      local range_size=${ip_range##*.}
+      local min=$((${range_size%%-*}))
+      local max=$((${range_size##*-}))
+
+      if [[ $max -le $min ]]; then
+        error 5 "Invalid range: $ip_range"
+      fi
+      if [[ -z "$min" ]]; then
+        error 6 "Invalid range: $ip_range"
+      fi
+      if [[ $max -gt 255 ]]; then
+        error 7 "Invalid range: $ip_range"
+      fi
+      ;;
+    cidr )
+      log "$ip_range is a cidr"
+      local block_size=${ip_range##*/}
+
+      if [[ "$block_size" -lt 24 ]]; then
+        error 4 "$ip_range's block size is too large"
+      fi
+      ;;
+  esac
+
+  local nmap="$(nmap -sL $ip_range 2>&1)"
+  if grep -q 'Failed to resolve' <<< "$nmap"; then
+    error 8 "$nmap"
+  fi
+
+  echo "$nmap" | awk '/Nmap scan report/{print $NF}' | sed 's/(\(.*\))/\1/g'
+}
+
+function dns-check.ignored() {
+  echo "^10\..*"
+  for i in {16..31}; do
+    echo "^172.$i\..*"
+  done
+  echo "^192.168\..*"
+}
+
+###
+# @description Prints the available subcommands
+##
+function dns-check.subcommands() {
+  local fn_match=".*$__SCRIPT__.\(.*\)"
+  declare -f -F | grep -e "$fn_match" | sed -n "s/$fn_match/\1/p"
 }
 
 if [[ ${BASH_SOURCE[0]} != $0 ]]; then
-  export -f dns-check
+  for fn in $(dns-check.subcommands); do
+    export -f $__SCRIPT__.$fn
+  done
 else
   set -euo pipefail
 

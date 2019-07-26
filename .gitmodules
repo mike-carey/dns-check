@@ -1,0 +1,3 @@
+[submodule "bats-print"]
+	path = vendor/bats-print
+	url = https://github.com/mike-carey/bats-print.git
